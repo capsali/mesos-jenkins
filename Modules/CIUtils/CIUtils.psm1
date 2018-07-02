@@ -95,8 +95,8 @@ function Start-GitClone {
     if(Test-Path -Path $Path) {
         Remove-Item -Recurse -Force -Path $Path
     }
-    Start-ExternalCommand { git.exe clone $URL $Path } -ErrorMessage "Failed to clone the repository"
-    Start-ExternalCommand { git.exe -C $Path checkout $Branch } -ErrorMessage "Failed to checkout branch $Branch"
+    Start-ExternalCommand { git.exe clone -q $URL $Path } -ErrorMessage "Failed to clone the repository"
+    Start-ExternalCommand { git.exe -C $Path checkout -q $Branch } -ErrorMessage "Failed to checkout branch $Branch"
 }
 
 function Set-VCVariables {
@@ -350,7 +350,7 @@ function Start-FileDownload {
         $params += @('--user', "${User}:${Password}")
     }
     if($Force) {
-        $params += 'insecure'
+        $params += '--insecure'
     }
     $params += @('-o', $Destination, $URL)
     $p = Start-Process -FilePath 'curl.exe' -ArgumentList $params -Wait -PassThru
