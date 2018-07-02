@@ -21,7 +21,7 @@
     "type": "DOCKER",
     "volumes": [],
     "docker": {
-      "image": "dcoswindowsci/private-windows:1803",
+      "image": "capsali/private-windows:1803",
       "privileged": false,
       "parameters": [
         {
