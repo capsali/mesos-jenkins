@@ -79,6 +79,7 @@ WINDOWS_APP_CONTAINER_TEMPLATE="$DIR/templates/marathon/windows-app-container.js
 WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE="${WORKSPACE}/windows-app-container.json"
 DOCKER_PRIVATE_TEMPLATE="$DIR/templates/marathon/docker-private-image.json"
 DOCKER_PRIVATE_RENDERED_TEMPLATE="${WORKSPACE}/docker-private-image.json"
+IIS_TEMPLATE="$DIR/templates/marathon/iis.json"
 WINDOWS_APP_PUBLISH_TEMPLATE="$DIR/templates/marathon/windows-app-publish.json"
 WINDOWS_APP_PUBLISH_RENDERED_TEMPLATE="${WORKSPACE}/windows-app-publish.json"
 FETCHER_HTTP_TEMPLATE="$DIR/templates/marathon/fetcher-http.json"
@@ -88,11 +89,11 @@ FETCHER_HTTPS_RENDERED_TEMPLATE="${WORKSPACE}/fetcher-https.json"
 FETCHER_LOCAL_TEMPLATE="$DIR/templates/marathon/fetcher-local.json"
 FETCHER_LOCAL_RENDERED_TEMPLATE="${WORKSPACE}/fetcher-local.json"
 FETCHER_LOCAL_FILE_URL="http://dcos-win.westus.cloudapp.azure.com/dcos-windows/testing/fetcher-test.zip"
-FETCHER_FILE_MD5="07D6BB2D5BAED0C40396C229259CAA71"
+FETCHER_FILE_MD5="07d6bb2d5baed0c40396c229259caa71"
 LOG_SERVER_ADDRESS="dcos-win.westus.cloudapp.azure.com"
 LOG_SERVER_USER="jenkins"
-REMOTE_LOGS_DIR="/data/${JOB_NAME}"
-LOGS_BASE_URL="http://dcos-win.westus.cloudapp.azure.com/${JOB_NAME}"
+REMOTE_LOGS_DIR="/data/artifacts/${JOB_NAME}"
+LOGS_BASE_URL="http://dcos-win.westus.cloudapp.azure.com/artifacts/${JOB_NAME}"
 UTILS_FILE="$DIR/utils/utils.sh"
 BUILD_OUTPUTS_URL="$LOGS_BASE_URL/$BUILD_ID"
 PARAMETERS_FILE="$WORKSPACE/build-parameters.txt"
@@ -261,7 +262,13 @@ open_dcos_port() {
 }
 
 setup_remote_winrm_client() {
-    upload_files_via_scp -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -f "/tmp/wsmancmd" "$DIR/utils/bin/wsmancmd" || {
+    local WSMANCMD_URL="http://dcos-win.westus.cloudapp.azure.com/downloads/wsmancmd"
+    curl -s --retry 30 "${WSMANCMD_URL}" -o $WORKSPACE/wsmancmd || {
+        echo "ERROR: Failed to download wsmancmd binary from ${WSMANCMD_URL}"
+        return 1
+    }
+    chmod +x $WORKSPACE/wsmancmd
+    upload_files_via_scp -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -f "/tmp/wsmancmd" "$WORKSPACE/wsmancmd" || {
         echo "ERROR: Failed to copy wsmancmd binary to the proxy master node"
         return 1
     }
@@ -321,7 +328,7 @@ test_dcos_task_connectivity() {
 
 test_win_marathon_app_port_container() {
     #
-    # - Deploy a simple IIS web server on Windows
+    # - Deploy a simple web server on Windows
     # - Check if Marathon successfully launched the Mesos Docker task
     # - Check if the exposed port is open
     # - Check if the DNS records for the task are advertised to the Windows nodes
@@ -367,7 +374,7 @@ test_win_marathon_app_port_container() {
 
 test_win_marathon_app_port_publish() {
     #
-    # - Deploy a simple DC/OS IIS marathon application
+    # - Deploy a simple DC/OS marathon application
     #
     local AGENT_HOSTNAME=$1
     local AGENT_ROLE=$2
@@ -378,7 +385,7 @@ test_win_marathon_app_port_publish() {
 	EOF
 	" > $WINDOWS_APP_PUBLISH_RENDERED_TEMPLATE
     # Start deployment
-    echo "Deploying IIS application on DC/OS"
+    echo "Deploying Windows application on DC/OS"
     dcos marathon app add $WINDOWS_APP_PUBLISH_RENDERED_TEMPLATE || {
         echo "ERROR: Failed to deploy the Windows Marathon application"
         return 1
@@ -397,7 +404,7 @@ test_win_marathon_app_port_publish() {
 
 test_docker_private_image() {
     #
-    # Check if marathon can spawn a simple DC/OS IIS marathon application from a private docker image
+    # Check if marathon can spawn a simple DC/OS Windows marathon application from a private docker image
     #
     local AGENT_HOSTNAME=$1
     local AGENT_ROLE=$2
@@ -440,7 +447,7 @@ test_docker_private_image() {
         return 1
     }
 
-    echo "Deploying IIS application from private image on DC/OS"
+    echo "Deploying Windows application from private image on DC/OS"
     dcos marathon app add $DOCKER_PRIVATE_RENDERED_TEMPLATE || {
         echo "ERROR: Failed to deploy the Windows Marathon application from private image"
         return 1
@@ -482,7 +489,9 @@ test_mesos_fetcher() {
         echo "ERROR: Fetcher file MD5 checksum is not correct. The checksum found is $MD5_CHECKSUM and the expected one is $FETCHER_FILE_MD5"
         return 1
     fi
-    echo "The MD5 checksum for the fetcher file was successfully checked"
+    echo -e "\n"
+    echo -e "The MD5 checksum for the fetcher file was successfully checked"
+    echo -e "\n"
 }
 
 test_mesos_fetcher_local() {
@@ -710,6 +719,16 @@ test_dcos_windows_apps() {
         test_mesos_fetcher_remote_http "$PUBLIC_AGENT_IP" "$AGENT_ROLE" || return 1
         test_mesos_fetcher_remote_https "$PUBLIC_AGENT_IP" "$AGENT_ROLE" || return 1
     done
+
+    # Shutdown testing
+    local AGENT_ROLES=("*" "slave_public")
+    for ROLE in "${AGENT_ROLES[@]}"; do
+        test_windows_agent_graceful_shutdown "${ROLE}" || return 1
+        test_windows_agent_ungraceful_shutdown "${ROLE}" || return 1
+    done
+    
+    # Resiliency testing
+    test_windows_agent_resiliency || return 1
 }
 
 test_windows_agent_recovery() {
@@ -788,6 +807,299 @@ test_windows_agent_recovery() {
     remove_dcos_marathon_app $APP_NAME || return 1
 }
 
+test_windows_agent_graceful_shutdown() {
+    local AGENT_ROLE="$1"
+    if [[ "${AGENT_ROLE}" == "*" ]]; then
+        local APP_ID="test-windows-graceful-shutdown-private-agent"
+    else
+        local APP_ID="test-windows-graceful-shutdown-public-agent"
+    fi
+    # eval-ing template and deleting hostname constraint -- failover impossible with constraint
+    eval "cat <<-EOF
+	$(cat $WINDOWS_APP_CONTAINER_TEMPLATE | jq -r 'del(.constraints[1])')
+	EOF
+	" > $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE
+
+    echo "Deploying a Windows Marathon application on DC/OS"
+
+    dcos marathon app add $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE || {
+        echo "ERROR: Failed to deploy the Windows Marathon application"
+        return 1
+    }
+    
+    local APP_NAME=$(get_marathon_application_name $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE)
+    
+    $DIR/utils/check-marathon-app-health.py --name $APP_NAME || {
+        echo "ERROR: Failed to get $APP_NAME application health checks"
+        dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+        return 1
+    }
+    local PORT=$(get_marathon_application_host_port $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE)
+    local AGENT_HOSTNAME=$(dcos marathon app show $APP_NAME | jq -r ".tasks[0].host")
+    test_dcos_task_connectivity "$APP_NAME" "$AGENT_HOSTNAME" "$AGENT_ROLE" "$PORT" || return 1
+    
+    #
+    #### Stopping service
+    #
+    setup_remote_winrm_client || return 1
+    upload_files_via_scp -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -f "/tmp/stop-mesos-service.ps1" "$DIR/utils/stop-mesos-service.ps1" || {
+        echo "ERROR: Failed to scp stop-mesos-service.ps1"
+        return 1
+    }
+    echo "Stopping the dcos-mesos-slave service on $AGENT_HOSTNAME"
+    local REMOTE_CMD_STOP="/tmp/wsmancmd -H $AGENT_HOSTNAME -s -a basic -u $WIN_AGENT_ADMIN -p $WIN_AGENT_ADMIN_PASSWORD --powershell --file /tmp/stop-mesos-service.ps1"
+    local CHECK_RESULT_STOP=$(run_ssh_command -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -c "$REMOTE_CMD_STOP" 2>/dev/null) || {
+        echo -e "Error: Failed to run service kill script on $AGENT_HOSTNAME"
+        return 1
+    }
+
+    if [ "$CHECK_RESULT_STOP" == "SUCCESS" ]; then
+        echo "Service dcos-mesos-slave successfully Stopped!"
+    elif [ "$CHECK_RESULT_STOP" == "FAILURE" ]; then
+        echo "ERROR: Service dcos-mesos-slave stopping failure"
+        return 1
+    else
+        echo "ERROR: Service dcos-mesos-slave is in '$CHECK_RESULT' state, which is unknown"
+        return 1
+    fi
+
+    echo "Waiting with a timeout of 3mins for DCOS to migrate the task from $AGENT_HOSTNAME..."
+    local NEW_TASK_HOST=""
+    SECONDS=0
+    while true; do
+        if [[ $SECONDS -gt 180 ]]; then
+            echo "ERROR: task for $APP_NAME didn't migrate from $AGENT_HOSTNAME within $TIMEOUT seconds"
+            return 1
+        fi
+        NEW_TASK_HOST=$(dcos marathon app show $APP_NAME | jq -r ".tasks[0].host")
+        if [[ $NEW_TASK_HOST != $AGENT_HOSTNAME ]] && [[ ! -z $NEW_TASK_HOST ]] && [[ $NEW_TASK_HOST != "null" ]]; then
+            echo "Task successfully migrated from $AGENT_HOSTNAME to $NEW_TASK_HOST"    
+            break
+        else
+            sleep 1
+        fi
+
+    done
+
+    # Check task health after task failover
+    $DIR/utils/check-marathon-app-health.py --name $APP_NAME --ignore-last-task-failure || {
+        echo "ERROR: Failed to get $APP_NAME application health checks"
+        dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+        return 1
+    }
+    test_dcos_task_connectivity "$APP_NAME" "$NEW_TASK_HOST" "$AGENT_ROLE" "$PORT" || return 1
+    echo "Graceful shutdown successful on $AGENT_HOSTNAME!"
+
+    remove_dcos_marathon_app $APP_NAME || return 1
+    
+    # Start service back up
+    upload_files_via_scp -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -f "/tmp/start-mesos-service.ps1" "$DIR/utils/start-mesos-service.ps1" || {
+        echo "ERROR: Failed to scp start-mesos-service.ps1"
+        return 1
+    }
+    local REMOTE_CMD_START="/tmp/wsmancmd -H $AGENT_HOSTNAME -s -a basic -u $WIN_AGENT_ADMIN -p $WIN_AGENT_ADMIN_PASSWORD --powershell --file /tmp/start-mesos-service.ps1"
+    local CHECK_RESULT_START=$(run_ssh_command -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -c "$REMOTE_CMD_START" 2>/dev/null) || {
+        echo -e "Error: Failed to run service start script on $AGENT_HOSTNAME"
+        return 1
+    }
+
+    if [ "$CHECK_RESULT_START" == "SUCCESS" ]; then
+        echo "Service dcos-mesos-slave successfully started back up!"
+    elif [ "$CHECK_RESULT_START" == "FAILURE" ]; then
+        echo "ERROR: Service dcos-mesos-slave starting failure"
+        return 1
+    else
+        echo "ERROR: Service dcos-mesos-slave is in '$CHECK_RESULT' state, which is unknown"
+        return 1
+    fi
+}
+
+test_windows_agent_ungraceful_shutdown() {
+    local AGENT_ROLE="$1"
+    if [[ "${AGENT_ROLE}" == "*" ]]; then
+        local APP_ID="test-windows-ungraceful-shutdown-private-agent"
+    else
+        local APP_ID="test-windows-ungraceful-shutdown-public-agent"
+    fi
+    # eval-ing template and deleting hostname constraint -- failover impossible with constraint
+    eval "cat <<-EOF
+	$(cat $WINDOWS_APP_CONTAINER_TEMPLATE | jq -r 'del(.constraints[1])')
+	EOF
+	" > $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE
+
+    echo "Deploying a Windows Marathon application on DC/OS"
+
+    dcos marathon app add $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE || {
+        echo "ERROR: Failed to deploy the Windows Marathon application"
+        return 1
+    }
+    
+    local APP_NAME=$(get_marathon_application_name $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE)
+    
+    $DIR/utils/check-marathon-app-health.py --name $APP_NAME || {
+        echo "ERROR: Failed to get $APP_NAME application health checks"
+        dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+        return 1
+    }
+    local PORT=$(get_marathon_application_host_port $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE)
+    local AGENT_HOSTNAME=$(dcos marathon app show $APP_NAME | jq -r ".tasks[0].host")
+    test_dcos_task_connectivity "$APP_NAME" "$AGENT_HOSTNAME" "$AGENT_ROLE" "$PORT" || return 1
+    
+    #
+    #### Killing the service
+    #
+    setup_remote_winrm_client || return 1
+    upload_files_via_scp -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -f "/tmp/kill-mesos-agent-ungraceful.ps1" "$DIR/utils/kill-mesos-agent-ungraceful.ps1" || {
+        echo "ERROR: Failed to scp kill-mesos-agent-ungraceful.ps1"
+        return 1
+    }
+    echo "Killing the dcos-mesos-slave service on $AGENT_HOSTNAME and disabling recovery options"
+    local REMOTE_CMD_STOP="/tmp/wsmancmd -H $AGENT_HOSTNAME -s -a basic -u $WIN_AGENT_ADMIN -p $WIN_AGENT_ADMIN_PASSWORD --powershell --file /tmp/kill-mesos-agent-ungraceful.ps1"
+    local CHECK_RESULT_STOP=$(run_ssh_command -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -c "$REMOTE_CMD_STOP" 2>/dev/null) || {
+        echo -e "Error: Failed to run service kill script on $AGENT_HOSTNAME"
+        return 1
+    }
+
+    if [ "$CHECK_RESULT_STOP" == "SUCCESS" ]; then
+        echo "Service dcos-mesos-slave successfully Stopped!"
+    elif [ "$CHECK_RESULT_STOP" == "FAILURE" ]; then
+        echo "ERROR: Service dcos-mesos-slave stopping failure"
+        return 1
+    else
+        echo "ERROR: Service dcos-mesos-slave is in '$CHECK_RESULT' state, which is unknown"
+        return 1
+    fi
+
+    echo "Waiting with a timeout of 5mins for DCOS to fail the task over from $AGENT_HOSTNAME..."
+    local NEW_TASK_HOST=""
+    SECONDS=0
+    while true; do
+        if [[ $SECONDS -gt 300 ]]; then
+            echo "ERROR: task for $APP_NAME didn't migrate from $AGENT_HOSTNAME within $TIMEOUT seconds"
+            return 1
+        fi
+        NEW_TASK_HOST=$(dcos marathon app show $APP_NAME | jq -r ".tasks[0].host")
+        if [[ $NEW_TASK_HOST != $AGENT_HOSTNAME ]] && [[ ! -z $NEW_TASK_HOST ]] && [[ $NEW_TASK_HOST != "null" ]]; then
+            echo "Task successfully fail-overed from $AGENT_HOSTNAME to $NEW_TASK_HOST"    
+            break
+        fi
+        sleep 1
+    done
+
+    # Check task health after task failover
+    $DIR/utils/check-marathon-app-health.py --name $APP_NAME --ignore-last-task-failure || {
+        echo "ERROR: Failed to get $APP_NAME application health checks"
+        dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+        return 1
+    }
+    test_dcos_task_connectivity "$APP_NAME" "$NEW_TASK_HOST" "$AGENT_ROLE" "$PORT" || return 1
+
+    remove_dcos_marathon_app $APP_NAME || return 1
+    
+    # Start service back up on old host
+    upload_files_via_scp -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -f "/tmp/start-mesos-service.ps1" "$DIR/utils/start-mesos-service.ps1" || {
+        echo "ERROR: Failed to scp start-mesos-service.ps1"
+        return 1
+    }
+    local REMOTE_CMD_START="/tmp/wsmancmd -H $AGENT_HOSTNAME -s -a basic -u $WIN_AGENT_ADMIN -p $WIN_AGENT_ADMIN_PASSWORD --powershell --file /tmp/start-mesos-service.ps1"
+    local CHECK_RESULT_START=$(run_ssh_command -i $PRIVATE_SSH_KEY_PATH -u $LINUX_ADMIN -h $MASTER_PUBLIC_ADDRESS -p "2200" -c "$REMOTE_CMD_START" 2>/dev/null) || {
+        echo -e "Error: Failed to run service start script on $AGENT_HOSTNAME"
+        return 1
+    }
+
+    if [ "$CHECK_RESULT_START" == "SUCCESS" ]; then
+        echo "Service dcos-mesos-slave successfully started back up on $AGENT_HOSTNAME!"
+    elif [ "$CHECK_RESULT_START" == "FAILURE" ]; then
+        echo "ERROR: Service dcos-mesos-slave starting failure"
+        return 1
+    else
+        echo "ERROR: Service dcos-mesos-slave is in '$CHECK_RESULT' state, which is unknown"
+        return 1
+    fi
+
+    local TASKS=$(dcos marathon task list | grep $AGENT_HOSTNAME)
+    if [[ $TASKS == "" ]]; then
+        echo "Ungraceful shutdown and task failover is successful on $AGENT_HOSTNAME!"
+    else
+        echo "ERROR: Tasks still active on $AGENT_HOSTNAME"
+        return 1
+    fi
+
+}
+
+test_windows_agent_resiliency() {
+    local AGENT_ROLE="slave_public"
+    local APP_ID="test-windows-resiliency-public-agent"
+
+    # eval-ing template and deleting hostname constraint, also set instances number to number of public windows agents
+    eval "cat <<-EOF
+	$(cat $WINDOWS_APP_CONTAINER_TEMPLATE | jq -r 'del(.constraints[1])' | jq -r ".instances = $WIN_PUBLIC_AGENT_COUNT")
+	EOF
+	" > $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE
+
+    echo "Deploying a Windows Marathon application on DC/OS"
+
+    dcos marathon app add $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE || {
+        echo "ERROR: Failed to deploy the Windows Marathon application"
+        return 1
+    }
+    
+    local APP_NAME=$(get_marathon_application_name $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE)
+    
+    $DIR/utils/check-marathon-app-health.py --name $APP_NAME || {
+        echo "ERROR: Failed to get $APP_NAME application health checks"
+        dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+        return 1
+    }
+    local PORT=$(get_marathon_application_host_port $WINDOWS_APP_CONTAINER_RENDERED_TEMPLATE)
+    local AGENT_HOSTNAME=$(dcos marathon app show $APP_NAME | jq -r ".tasks[0].host")
+    test_dcos_task_connectivity "$APP_NAME" "$WIN_AGENT_PUBLIC_ADDRESS" "slave_public" "$PORT" || return 1
+    
+    #
+    #### Killing the tasks
+    #
+
+    local TASK_IDS=$(dcos marathon task list | grep $APP_NAME | awk '{print$5}')
+    for TASK_ID in $TASK_IDS; do
+        dcos marathon task kill "$TASK_ID"
+    done
+
+    $DIR/utils/check-marathon-app-health.py --name $APP_NAME || {
+        echo "ERROR: Failed to get $APP_NAME application health checks"
+        dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+        return 1
+    }
+    test_dcos_task_connectivity "$APP_NAME" "$WIN_AGENT_PUBLIC_ADDRESS" "slave_public" "$PORT" || return 1
+    echo "Resiliency testing successful for Windows public nodes!"
+
+    remove_dcos_marathon_app $APP_NAME || return 1
+}
+
+test_iis() {
+    #
+    # - Deploy a simple DC/OS IIS marathon application
+    #
+    echo "Deploying IIS application on DC/OS"
+    dcos marathon app add $IIS_TEMPLATE || {
+        echo "ERROR: Failed to deploy the IIS Marathon application"
+        return 1
+    }
+    APP_NAME=$(get_marathon_application_name $IIS_TEMPLATE)
+    $DIR/utils/check-marathon-app-health.py --name $APP_NAME || {
+        echo "ERROR: Failed to get $APP_NAME application health checks"
+        dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+        return 1
+    }
+    echo "Checking, with a timeout of 900 seconds, if the port 80 is open at the address: $WIN_AGENT_PUBLIC_ADDRESS"
+    check_open_port "$WIN_AGENT_PUBLIC_ADDRESS" "80" "900" || {
+        echo "ERROR: Port 80 is not open for the application: $APP_NAME"
+        dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+        return 1
+    }
+    echo "Success: Port 80 is open at address $WIN_AGENT_PUBLIC_ADDRESS"
+    dcos marathon app show $APP_NAME > "${TEMP_LOGS_DIR}/dcos-marathon-${APP_NAME}-app-details.json"
+    remove_dcos_marathon_app $APP_NAME || return 1
+}
 
 run_functional_tests() {
     #
@@ -796,9 +1108,10 @@ run_functional_tests() {
     #  - Test if the custom attributes are set
     #  - Test if the Mesos master - agent authentication is enabled
     #  - Test DC/OS DNS functionality from the Windows node
+    #  - Test a DC/OS Windows task with IIS web server
     #  - Test if a Windows marathon application can be successfully deployed and consumed
     #  - Test Windows agent recovery after taskkill
-    #  - Test a simple IIS marathon Windows app
+    #  - Test a simple marathon Windows app
     #  - Test Mesos fetcher with local resource
     #  - Test Mesos fetcher with remote http resource
     #  - Test Mesos fetcher with remote https resource
@@ -807,6 +1120,7 @@ run_functional_tests() {
     test_custom_attributes || return 1
     test_master_agent_authentication || return 1
     test_dcos_dns || return 1
+    test_iis || return 1
     test_dcos_windows_apps || return 1
 }
 

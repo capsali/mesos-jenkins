@@ -1,10 +1,10 @@
 ﻿Param(
-    [string]$DiagnosticsPackageUrl="http://dcos-win.westus.cloudapp.azure.com/diagnostics-build/dcos/latest/binaries/diagnostics.zip",
-    [string]$MetricsPackageUrl="http://dcos-win.westus.cloudapp.azure.com/metrics-build/dcos/latest/binaries/metrics.zip",
-    [string]$MesosPackageUrl="http://dcos-win.westus.cloudapp.azure.com/mesos-build/apache/latest/binaries/mesos-binaries.zip",
-    [string]$DcosNetPackageUrl="http://dcos-win.westus.cloudapp.azure.com/net-build/dcos/latest/release.zip",
-    [string]$SpartanPackageUrl="http://dcos-win.westus.cloudapp.azure.com/spartan-build/master/latest/release.zip",
-    [string]$DockerBinariesBaseUrl="http://dcos-win.westus.cloudapp.azure.com/downloads/docker/18.03.1-ce",
+    [string]$DiagnosticsPackageUrl="http://dcos-win.westus.cloudapp.azure.com/artifacts/dcos-diagnostics-build/latest-diagnostics-build/binaries/diagnostics.zip",
+    [string]$MetricsPackageUrl="http://dcos-win.westus.cloudapp.azure.com/artifacts/dcos-metrics-build/latest-metrics-build/binaries/metrics.zip",
+    [string]$MesosPackageUrl="http://dcos-win.westus.cloudapp.azure.com/artifacts/dcos-mesos-build/latest-mesos-build/binaries/mesos-binaries.zip",
+    [string]$DcosNetPackageUrl="http://dcos-win.westus.cloudapp.azure.com/artifacts/dcos-net-build/latest-net-build/release.zip",
+    [string]$SpartanPackageUrl="http://dcos-win.westus.cloudapp.azure.com/artifacts/dcos-spartan-build/latest-spartan-build/release.zip",
+    [string]$DockerBinariesBaseUrl="http://dcos-win.westus.cloudapp.azure.com/downloads/docker/18-03-1-ee-1",
     [string]$ParametersFile="${env:TEMP}\generate-blob-parameters.json",
     [string]$GithubPRHeadSha
 )
@@ -111,26 +111,12 @@ function New-DCOSWindowsAgentBlob {
     Expand-Archive -Path $dcoswindowsArchive -DestinationPath $dcoswindowsTmpDir -Force
     Remove-Item -Force -Path $dcoswindowsArchive
     Copy-Item -Recurse -Path "${dcoswindowsTmpDir}\dcos-windows-${fileName}\scripts" -Destination $setupScripts
-    ###
-    # TODO(ibalutoiu): For backwards compatibility we also copy the scripts file to
-    #                  AGENT_BLOB_DIR\dcos-windows\scripts (the expected location atm).
-    #                  The following lines will be removed, only we fully transition
-    #                  to consume the agent Blob setup scripts from AGENT_BLOB_DIR\scripts
-    ###
     New-Item -ItemType Directory -Path "${blobDir}\dcos-windows"
     Copy-Item -Recurse -Force -Path $setupScripts -Destination "${blobDir}\dcos-windows\"
-    ###
-    # - Copy the init script and the pre-provision scripts for the CI
+    # - Copy the main init script
     $initScript = "${dcoswindowsTmpDir}\dcos-windows-${fileName}\DCOSWindowsAgentSetup.ps1"
-    if(!(Test-Path $initScript)) {
-        ###
-        # TODO(ibalutoiu): The DCOSWindowsAgentSetup.ps1 location should be in the
-        #                  repository root directory. Remove the old location, once
-        #                  it is not used anymore
-        $initScript = "${dcoswindowsTmpDir}\dcos-windows-${fileName}\scripts\DCOSWindowsAgentSetup.ps1"
-        ###
-    }
     Copy-Item -Path $initScript -Destination "$($global:PARAMETERS['ARTIFACTS_DIR'])\DCOSWindowsAgentSetup.ps1"
+    # - Copy the pre-provision scripts for the CI
     Copy-Item -Recurse -Path "$PSScriptRoot\..\DCOS\preprovision" -Destination "$($global:PARAMETERS['ARTIFACTS_DIR'])\preprovision"
     Remove-Item -Recurse -Force -Path $dcoswindowsTmpDir
 
